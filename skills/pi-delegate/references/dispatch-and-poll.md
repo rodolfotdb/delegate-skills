@@ -1,146 +1,87 @@
 # Dispatch and poll
 
-`scripts/relay.mjs` wraps pi's non-interactive JSON mode, captures its event stream, and writes a
-`result.json`. Run one command, then read one file.
+`scripts/relay.mjs` wraps `pi -p --mode json`, records the run and always writes `result.json`
+(Node built-ins only; it shells out to `pi`, `git`, and `taskkill` on Windows).
 
-## Before the first run
+## Flags
 
-```bash
-command -v pi
-pi --version
-pi --list-models   # optional: pick a model id for --model
-```
+| Flag | Meaning |
+|---|---|
+| `--brief <file>` | brief path; stdin when omitted |
+| `--cd <dir>` | working root (default cwd) |
+| `--lane <name>` | fleet lane from delegate-setup (explicit flags win) |
+| `--model <name>` | allow-list entry, `provider/id` or short id (default `opencode-go/deepseek-v4.1-flash`) |
+| `--effort low\|medium\|high\|xhigh\|max` | passed as `--thinking` |
+| `--read-only` | `--exclude-tools write,edit,bash`, MCP and extensions forced off |
+| `--mcp` `--extensions` `--skills` | opt back in (default: all off) |
+| `--timeout <dur>` | h/m/s watchdog, default `30m` |
+| `--out-dir <dir>` | artifacts dir, fresh per dispatch (default under the system temp dir) |
+| `--task-id` `--resume-from` `--resume-reason` `--session` | same-task resume, see SKILL.md |
 
-Install with `npm install -g @earendil-works/pi-coding-agent`. Authenticate with `/login` inside
-pi (subscription providers) or an API-key environment variable; pi stores credentials in
-`~/.pi/agent/`.
+Environment: `PI_DELEGATE_BIN` overrides the pi executable (a `.js`/`.mjs` runs under node; used by the
+fake in tests). Without it the relay searches `PATH`, then `~/.pi/agent/bin`. On Windows it runs the
+managed `pi-launcher.js` under node, so there is no `cmd.exe` quoting.
 
-## Dispatching
+## What the relay does
 
-```bash
-node "<skill-dir>/scripts/relay.mjs" --brief brief.txt --cd /path/to/repo
-```
+1. Reads the brief, rejects an empty one (exit 2, no result).
+2. Reserves the out-dir, writes `brief.txt`, creates `sessions/`.
+3. Checks the model against the allow-list (fail early, no Pi run, result written).
+4. Finds `pi`, runs `pi --version` and `pi auth check --provider <p> --json`; missing binary or auth
+   not ready -> `pi_unavailable` (exit 127). The version probe has a 10 s cap (or the smaller
+   `--timeout`): a hang returns `timeout`/124; a non-zero exit returns `failed` without dispatch.
+   The auth probe retains its 60 s cap and an inconclusive result never blocks dispatch.
+   Catchable signals during either probe terminate its process tree and write `aborted`.
+5. Fingerprints the git tree, spawns Pi, streams stdout to `pi.jsonl`, parses events incrementally.
+6. Watchdog on `--timeout`: kills the process tree (`taskkill /t` on Windows, process group elsewhere).
+7. Fingerprints again, builds `touchedFiles` from `git status --porcelain`, writes `result.json`.
 
-`<skill-dir>` is the installed folder containing this skill's `SKILL.md`.
+## Event stream (what the status is built from)
 
-| Flag | Effect |
-| --- | --- |
-| `--brief <file>` | Brief path. Omit it to read the brief from stdin. |
-| `--cd <dir>` | Working root and child process cwd (default: current directory). |
-| `--lane <name>` | Fleet lane from `delegate-setup` config. Applies that lane's dials; fails if the lane's `implementer` is not this relay. Explicit dial flags win. |
-| `--provider <name>` | pi provider name (default: pi's own default). Token-validated. |
-| `--model <pattern>` | pi model id or pattern (default: pi's own default). Token-validated: letters, digits, `. _ : / -`. |
-| `--session <id>` | Resume a specific pi session; send only the delta brief. |
-| `--resume-last` | Continue the most recent pi session for this cwd (`pi --continue`); send only the delta brief. |
-| `--read-only` | Restrict pi's callable tools to `--tools read,grep,find,ls`. |
-| `--approve` | Trust project-local `.pi` resources for this run. The default passes `--no-approve`. |
-| `--timeout <dur>` | Relay watchdog (default: `30m`; h/m/s strings). Pi has no timeout flag. |
-| `--out-dir <dir>` | Artifact directory (default: a fresh directory under the system temp dir). |
-| `-h`, `--help` | Print the relay's header help. |
+`session` (`id`), `turn_end` (`message.usage`, `provider`, `model`), `agent_end` (`messages`,
+`willRetry`; the last assistant message has `stopReason` `stop` or `error` plus `errorMessage`),
+`auto_retry_end` (`success`, `finalError`), `agent_settled`. Also accepts upstream
+`message_end` assistant messages (string or text-part content). The object scanner tolerates
+concatenated events, chunk boundaries, junk prefixes and missing final newlines; partial retained
+objects are capped at 1 MiB. Usage comes from `turn_end` when present, otherwise `message_end`,
+so emitting both does not double-count tokens. An assistant message with
+`stopReason: "error"` or a failed auto-retry is a provider error even though the process exits 0.
 
-`--session` and `--resume-last` are mutually exclusive. The child cwd pins the workspace; pi has
-no add-dir flag and no sandbox, so reachability is simply the filesystem.
+## result.json (schema `delegate-relay.result.v1`)
 
-Remember: pi has no permission modes. A run without `--read-only` can write and execute anything
-the user account can. `--read-only` removes write/edit/bash from Pi's callable tool surface, but
-installed extension code still runs with the user's host permissions.
+`runContext`, `lane`, `tool: "pi"`, `workdir`, `provider`, `model`, `requestedModel`, `effort`,
+`readOnly`, `readOnlyViolation` (null / false / true), `resumed`, `piVersion`, `sessionId`,
+`sessionDir`, `startedAt`, `finishedAt`, `briefPath`, `finalPath`, `logPath`, `stderrPath`, `usage`
+(`input`, `output`, `cacheRead`, `totalTokens`, `cost`), `dirtyBefore` (porcelain lines already dirty
+before the run), `status`, `exitCode`, `signal`, `finalMessage`, `touchedFiles`, and when relevant
+`actualProvider`, `actualModel`, `stopReason`, `error`, `errorKind`, `quotaExhausted`, `stderrTail`, `attempts` (reason/durationMs per dispatch).
 
-## Artifacts and result fields
+Exit codes: 0 completed; 1 failed / provider error; 2 usage error or model outside the allow-list;
+124 timeout; 127 `pi_unavailable`; 128+N when killed by signal N.
 
-Artifacts live outside the repo by default, so they do not appear in `touchedFiles`; an
-`--out-dir` inside the worktree can make the artifacts appear there:
+## Backgrounding
 
-- `brief.txt` - the exact brief.
-- `events.jsonl` - raw pi stdout events (the session header, then every agent event).
-- `final.txt` - assistant text joined with a blank line between chunks; absent if none was emitted.
-- `stderr.txt` - complete stderr.
-- `result.json` - the stable `delegate-relay.result.v1` contract.
+Claude Code: Bash with `run_in_background: true`, you are notified on exit. Elsewhere: background it and
+poll for `result.json` (it is published atomically). A non-zero exit with no file is a usage error.
 
-`result.json` fields:
+## Recovery
 
-- `schema`, `tool` (`"pi"`), `status` (`completed` | `failed` | `timeout` | `aborted` | `pi_unavailable`), `exitCode`, and
-  `signal` (`null` unless the child died on a signal).
-- `workdir`, requested `provider`/`model`, `projectTrusted`, `readOnly`, `resumed`, `piVersion`,
-  `sessionId`, `startedAt`, and `finishedAt`.
-- `actualProvider`, `actualModel`, `usage`, and `stopReason` from Pi's final assistant event.
-- `briefPath`, `finalPath`, `eventsPath`, and `stderrPath`.
-- `sessionId` - parsed from the JSON stream's `session` header. Resume with `--session <id>`.
-  Note: `--continue` may mint a new session id for the continued run; the result always reports
-  the id of the run that just happened.
-- `finalMessage` - assistant text parts joined with `"\n\n"`; tool calls and tool results are
-  excluded.
-- `touchedFiles` - `git status --porcelain` lines for the **final working tree under `--cd` only**,
-  not an attribution of pi's edits: anything already dirty before dispatch shows up too. Dispatch
-  from a clean tree when you want the list to read as "what pi changed". `null` means git could
-  not report; `[]` means git ran and the tree is clean.
-- `stderrTail` - the last 20 non-empty stderr lines on any run that did not complete (`failed`,
-  `timeout`, `aborted`), except a launch failure, which reports `failed` with no `stderrTail`.
-- `error` - present for launch failures, preflight failures, when the relay watchdog fires
-  (`timeout`), and on an `aborted` run.
+- `model_unavailable` with HTTP 400 "requires Global regions": the OpenCode workspace region setting;
+  an operator fix, not a task failure.
+- `provider_unavailable`: transient upstream/endpoint outage (including 429/503), `quotaExhausted: false`; the relay retries the same call twice at fixed 10 s intervals only if its tree fingerprint proves no changes; otherwise stops. After `model_unavailable`, the caller may switch models once.
+- `quotaExhausted: true`: switch provider once (Codex or agy), do not retry in a loop.
+- `timeout`: inspect `git status` and partial work before re-dispatching; a new session does not undo it.
+- `failed` with a silent exit 0: read `pi.jsonl` and `stderr.txt`.
 
-Pi's stream carries thinking and message-update events the relay archives but does not parse.
+## Interrupted runs and lost work
 
-## Waiting for completion
+On native Windows a hard kill of the relay cannot be caught; if it exited without a result,
+inspect the tree and `pi.jsonl` directly. A child `SIGKILL` may indicate an OOM or supervisor
+kill; `SIGTERM` with `failed` means external termination. Inspect partial work before retrying.
+On POSIX the watchdog terminates the process group, then escalates after 10 s; Windows kills
+the whole tree immediately with `taskkill /t /f`.
 
-The relay blocks. Use the orchestrator's background-command facility, or background it in a
-shell and poll for `result.json`. The run is done only when the process exits and the file
-contains a `status`. The result file is written atomically, so a partial read is impossible.
-
-A pre-run usage error exits 2 and writes no result. A missing `pi` exits 127 and writes
-`status: "pi_unavailable"`.
-
-## When a run misbehaves
-
-- **`status: "pi_unavailable"` (exit 127):** install pi (`npm install -g @earendil-works/pi-coding-agent`),
-  authenticate, and re-dispatch.
-- **`status: "failed"`:** read `stderrTail`, `stderrPath`, and the tail of `events.jsonl`. Common
-  causes: an unknown `--model` (`Model "<x>" not found`), an expired login, or a provider error.
-  A final assistant event with `stopReason: "error"` or `"aborted"` is failed even if Pi exits zero.
-- **`status: "failed"` with an `error` mentioning `version preflight`:** the bounded `pi --version`
-  probe failed or hung, so pi was never dispatched. Check the install (`pi --version` yourself).
-- **`status: "aborted"`:** the relay itself was killed (its parent's timeout, a stopped task, a
-  closed terminal) and forwarded the kill to pi. The result is written before the relay exits;
-  inspect the working tree before re-dispatching. On native Windows a hard kill of the relay is
-  uncatchable (Node supports no `SIGTERM` handler there), so this status may never get written -
-  a relay process that is gone without a `result.json` is an aborted run; inspect the working
-  tree and `events.jsonl` directly.
-- **`status: "failed"` with `signal: "SIGKILL"`:** the host killed the process, commonly through
-  the OOM killer or a supervisor timeout. This is not a pi error; check host memory and
-  re-dispatch, or split the task into smaller briefs.
-- **`status: "timeout"`:** the `--timeout` watchdog killed the run; `error` reads
-  `pi did not finish within --timeout <dur>; killed by the relay watchdog`. Increase `--timeout`
-  or split the task. On POSIX the relay sends SIGTERM to the process group, waits 10 seconds,
-  then sends SIGKILL if needed; on Windows there is no escalation phase — the whole process tree
-  is felled immediately with `taskkill /pid <pid> /t /f`.
-- **Empty `finalMessage`:** inspect `touchedFiles` and the diff. Add a
-  `<structured_output_contract>` to the next brief to require a closing report.
-
-## Recovering lost work
-
-`events.jsonl` in the run directory records every event the implementer streamed. If finished
-work is lost — the run killed late, or the working tree damaged afterward — read the event log
-before re-dispatching: it identifies which files and tool commands were involved, which scopes
-what needs redoing. Tool execution events carry the write/edit arguments, but treat any
-reconstruction as unverified until it matches a working-tree diff — when the tree still holds the
-work, preserve the tree rather than replaying the log.
-
-## What the relay runs
-
-The launch is equivalent to:
-
-```bash
-cat brief.txt | pi --mode json [--provider <name>] [--model <pattern>] \
-  [--session <id> | --continue] [--approve | --no-approve] [--tools read,grep,find,ls]
-```
-
-The brief rides stdin, so it is not visible in the host process list and no argv size cap
-applies. On native Windows `pi` is a `.cmd` shim, so the relay launches it with `shell:true`;
-only the token-validated `--provider`/`--model`/`--session` values ever ride argv. Before dispatch the relay
-runs a bounded `pi --version` preflight (10s cap) so a hung or crashing CLI fails fast and
-explicitly instead of hanging the run. The relay passes `--no-approve` by default, so project
-`.pi` settings, extensions, and skills stay untrusted; `--approve` opts in for a trusted repository.
-
-## The commit boundary
-
-The relay never commits. Pi edits the working tree; the orchestrator reviews, re-runs the gates,
-and commits. See [review-and-land.md](review-and-land.md).
+Use `pi.jsonl` to identify files and tool commands after an interrupted run. Preserve work
+already in the tree. Any reconstruction from tool events must be verified against the diff;
+replaying commands can duplicate mutations. `touchedFiles` includes pre-existing dirt and
+may include artifacts when `--out-dir` is inside the worktree.
